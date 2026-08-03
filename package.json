@@ -1,0 +1,12 @@
+{
+  "name": "ewt-automation",
+  "version": "1.0.0",
+  "description": "升学E网通自动化",
+  "main": "src/ewt-automation.js",
+  "scripts": {
+    "start": "node src/ewt-automation.js"
+  },
+  "dependencies": {
+    "playwright": "^1.45.0"
+  }
+}
