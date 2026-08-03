@@ -45,7 +45,23 @@ const saveScreenshot = async (page, name) => {
   }
 };
 
-// 打印页面HTML片段用于调试
+// 等待SPA渲染完成
+const waitForSpaRender = async (page, selector, timeout = 30000) => {
+  log('SPA', `等待SPA渲染: ${selector} (超时${timeout}ms)`);
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const el = await page.$(selector);
+    if (el) {
+      log('SPA', `SPA渲染完成，找到: ${selector}`);
+      return true;
+    }
+    await page.waitForTimeout(500);
+  }
+  log('SPA', `SPA渲染超时，未找到: ${selector}`);
+  return false;
+};
+
+// 打印页面HTML片段
 const dumpPageHtml = async (page, maxLen = 2000) => {
   try {
     const html = await page.content();
@@ -182,8 +198,22 @@ async function handleAgreementModal(page) {
   return false;
 }
 
-// ==================== 检测页面是否有登录表单 ====================
-async function hasLoginForm(page) {
+// ==================== 检测页面是否有登录表单（等待SPA渲染） ====================
+async function hasLoginForm(page, waitForRender = true) {
+  if (waitForRender) {
+    // SPA页面，等待表单元素出现
+    log('Login', '等待SPA渲染登录表单...');
+    const rendered = await waitForSpaRender(page, 'input#login__password_userName', 15000);
+    if (!rendered) {
+      // 兜底：尝试其他选择器
+      const altRendered = await waitForSpaRender(page, 'input[type="password"]', 10000);
+      if (!altRendered) {
+        log('Login', 'SPA渲染超时，未找到任何登录表单');
+        return false;
+      }
+    }
+  }
+
   const userInput = await page.$('input#login__password_userName').catch(() => null);
   const passInput = await page.$('input#login__password_password').catch(() => null);
   const anyUser = await page.$('input[placeholder*="账号"], input[name="username"]').catch(() => null);
@@ -200,7 +230,7 @@ async function performLogin(page) {
   await saveScreenshot(page, 'login_attempt');
   await dumpPageHtml(page, 1500);
 
-  const hasForm = await hasLoginForm(page);
+  const hasForm = await hasLoginForm(page, true);
   if (!hasForm) {
     log('Login', '当前页面没有登录表单，打印页面标题...');
     const title = await page.title().catch(() => 'unknown');
@@ -254,6 +284,11 @@ async function performLogin(page) {
 async function login(page) {
   log('Login', '打开登录页...');
   await gotoWithRetry(page, 'https://web.ewt360.com/site-study/#/login');
+
+  // SPA页面，给JS渲染时间
+  log('Login', '页面已加载，等待SPA渲染（5秒）...');
+  await page.waitForTimeout(5000);
+
   await saveScreenshot(page, 'login_page_loaded');
   await dumpPageHtml(page, 1500);
 
@@ -269,7 +304,7 @@ async function login(page) {
   while (attempts < maxAttempts) {
     attempts++;
     const currentUrl = page.url();
-    const hasForm = await hasLoginForm(page);
+    const hasForm = await hasLoginForm(page, false); // 不重复等待渲染
     log('Login', `第${attempts}次检查: URL=${currentUrl} hasForm=${hasForm}`);
     await saveScreenshot(page, `login_check_${attempts}`);
     await dumpPageHtml(page, 1000);
@@ -282,7 +317,7 @@ async function login(page) {
 
     // 如果页面没有登录表单但在登录页，可能是被重定向了，等一等
     if (!hasForm && (currentUrl.includes('/login') || currentUrl.includes('/register'))) {
-      log('Login', '在登录页但没有表单，等待页面加载...');
+      log('Login', '在登录页但没有表单，等待SPA重新渲染...');
       await page.waitForTimeout(5000);
       continue;
     }
@@ -305,7 +340,6 @@ async function navigateToCourse(page) {
   await saveScreenshot(page, 'navigate_start');
   await dumpPageHtml(page, 1000);
 
-  // 如果在作业列表页，点击第一个任务
   if (currentUrl.includes('/student/homework') || currentUrl.includes('/holiday') || currentUrl.includes('/index')) {
     log('Navigate', '在作业/首页，查找任务入口...');
 
@@ -338,7 +372,6 @@ async function navigateToCourse(page) {
     }
   }
 
-  // 确保进入课程页面
   if (!page.url().includes('student-task-overview')) {
     log('Navigate', '直接跳转目标课程URL');
     await gotoWithRetry(page, 'https://teacher.ewt360.com/ewtbend/bend/index/index.html#/holiday/student-task-overview?homeworkId=10508160');
