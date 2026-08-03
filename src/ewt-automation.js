@@ -44,91 +44,160 @@ const LOCK = `(()=>{if(document.getElementById('ewt-progress-lock-style'))return
 
 const HIDE = `(()=>{Object.defineProperty(navigator,'webdriver',{get:()=>undefined});})();`;
 
-// ==================== 登录（修复版） ====================
-async function login(page) {
-  log('Login', '打开登录页...');
-  await page.goto('https://web.ewt360.com/site-study/#/login', { waitUntil: 'networkidle', timeout: 30000 });
-  await saveScreenshot(page, 'step1_login');
+// ==================== 协议弹窗处理（精确选择器） ====================
+async function handleAgreementModal(page) {
+  // 用户提供的精确选择器
+  const preciseSelector = 'div.ant-modal-wrap:nth-of-type(2) > div.ant-modal.login__password-agreement-modal > div.ant-modal-content:nth-of-type(2) > div.ant-modal-body:nth-of-type(2) > div > div.privacy__agreement__modal-btn:nth-of-type(2) > button.ant-btn.ant-btn-primary:nth-of-type(2) > span';
 
-  if (!CONFIG.username || !CONFIG.password) {
-    throw new Error('缺少账号或密码，请设置 EWT_USER 和 EWT_PASS 环境变量');
+  const preciseBtn = await page.$(preciseSelector);
+  if (preciseBtn && await preciseBtn.isVisible().catch(() => false)) {
+    log('Agreement', '找到精确选择器的"同意并继续"按钮');
+    await preciseBtn.click();
+    log('Agreement', '已点击"同意并继续"');
+    await page.waitForTimeout(3000);
+    return true;
   }
 
-  await page.fill('input#login__password_userName', CONFIG.username);
-  await page.fill('input#login__password_password', CONFIG.password);
+  // 兜底选择器
+  const fallbackSelectors = [
+    'button:has-text("同意并继续")',
+    'button:has-text("同意")',
+    'button:has-text("确认")',
+    '.ant-btn-primary:has-text("同意")',
+    '.login__password-agreement-modal button.ant-btn-primary',
+    '.privacy__agreement__modal-btn button',
+  ];
+
+  for (const sel of fallbackSelectors) {
+    const btn = await page.$(sel);
+    if (btn && await btn.isVisible().catch(() => false)) {
+      const text = await btn.textContent().catch(() => '');
+      log('Agreement', `找到兜底按钮: "${text.trim()}" (${sel})`);
+      const disabled = await btn.evaluate(e => e.disabled).catch(() => false);
+      if (disabled) {
+        log('Agreement', '按钮被禁用，等待倒计时...');
+        await page.waitForFunction((s) => {
+          const el = document.querySelector(s);
+          return el && !el.disabled;
+        }, { timeout: 10000 }, sel);
+      }
+      await btn.click();
+      log('Agreement', `已点击"${text.trim()}"`);
+      await page.waitForTimeout(3000);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// ==================== 通用登录函数 ====================
+async function performLogin(page) {
+  log('Login', '尝试在当前页面登录...');
+  await saveScreenshot(page, 'login_attempt');
+
+  const hasUserInput = await page.$('input#login__password_userName, input[placeholder*="账号"], input[name="username"], input[type="text"]').catch(() => null);
+  const hasPassInput = await page.$('input#login__password_password, input[placeholder*="密码"], input[name="password"], input[type="password"]').catch(() => null);
+
+  if (!hasUserInput || !hasPassInput) {
+    log('Login', '当前页面没有登录表单');
+    return false;
+  }
+
+  await page.fill('input#login__password_userName, input[placeholder*="账号"], input[name="username"], input[type="text"]', CONFIG.username);
+  await page.fill('input#login__password_password, input[placeholder*="密码"], input[name="password"], input[type="password"]', CONFIG.password);
   log('Login', '已填写账号密码');
 
   // 协议复选框
-  const cb = await page.$('label.ant-checkbox-wrapper input[type="checkbox"]');
+  const cb = await page.$('label.ant-checkbox-wrapper input[type="checkbox"], input[type="checkbox"]').catch(() => null);
   if (cb) {
-    const checked = await cb.evaluate(e => e.checked);
+    const checked = await cb.evaluate(e => e.checked).catch(() => true);
     if (!checked) {
       await cb.click();
       log('Login', '已勾选协议复选框');
     }
   }
 
-  await page.click('button.ant-btn.ant-btn-primary.ant-btn-lg.ant-btn-block');
-  log('Login', '已点击登录，等待页面响应...');
-
-  // 等待一段时间让页面处理登录请求
-  await page.waitForTimeout(2000);
-  await saveScreenshot(page, 'step2_after_login_click');
-
-  // 检测协议弹窗
-  const popupBtn = await page.$('button:has-text("同意"), button:has-text("确认"), .ant-btn:has-text("同意")');
-  if (popupBtn && await popupBtn.isVisible().catch(() => false)) {
-    const disabled = await popupBtn.evaluate(e => e.disabled).catch(() => false);
-    if (disabled) {
-      log('Login', '同意按钮被禁用，等待倒计时...');
-      await page.waitForFunction(() => {
-        const b = document.querySelector('button:has-text("同意"), button:has-text("确认")');
-        return b && !b.disabled;
-      }, { timeout: 10000 });
-    }
-    await popupBtn.click();
-    log('Login', '已点击弹窗同意按钮');
-    await page.waitForTimeout(3000); // 给页面跳转更多时间
+  // 点击登录
+  const loginBtn = await page.$('button.ant-btn.ant-btn-primary.ant-btn-lg.ant-btn-block, button:has-text("登录"), button[type="submit"]').catch(() => null);
+  if (loginBtn) {
+    await loginBtn.click();
+    log('Login', '已点击登录按钮');
+  } else {
+    log('Login', '未找到登录按钮');
+    return false;
   }
 
-  // 等待页面稳定（不强制检测特定元素，而是看URL变化）
-  log('Login', '等待页面加载...');
-  await page.waitForTimeout(5000);
-  await saveScreenshot(page, 'step3_after_agree');
+  // 等待响应
+  await page.waitForTimeout(3000);
+  await saveScreenshot(page, 'after_login_click');
 
-  const currentUrl = page.url();
-  log('Login', `当前页面URL: ${currentUrl}`);
-
-  // 如果还在登录页，说明登录失败
-  if (currentUrl.includes('/login')) {
-    // 检查是否有错误提示
-    const errorMsg = await page.$eval('.ant-form-item-explain-error, .login-error, [class*="error"]', el => el.textContent).catch(() => null);
-    if (errorMsg) {
-      throw new Error(`登录失败: ${errorMsg}`);
-    }
-    // 可能是加载慢，再等等
-    log('Login', '仍在登录页，继续等待...');
-    await page.waitForTimeout(10000);
-    if (page.url().includes('/login')) {
-      throw new Error('登录后页面未跳转，可能账号密码错误或需要验证码');
-    }
+  // 处理协议弹窗（使用精确选择器）
+  const modalHandled = await handleAgreementModal(page);
+  if (modalHandled) {
+    await saveScreenshot(page, 'after_agreement_modal');
   }
 
-  log('Login', '登录成功');
+  return true;
 }
 
-// ==================== 导航到课程（修复版） ====================
+// ==================== 主登录流程 ====================
+async function login(page) {
+  log('Login', '打开登录页...');
+  await page.goto('https://web.ewt360.com/site-study/#/login', { waitUntil: 'networkidle', timeout: 30000 });
+
+  if (!CONFIG.username || !CONFIG.password) {
+    throw new Error('缺少账号或密码，请设置 EWT_USER 和 EWT_PASS 环境变量');
+  }
+
+  await performLogin(page);
+
+  let attempts = 0;
+  const maxAttempts = 3;
+
+  while (attempts < maxAttempts) {
+    attempts++;
+    const currentUrl = page.url();
+    log('Login', `第${attempts}次尝试后URL: ${currentUrl}`);
+    await saveScreenshot(page, `login_check_${attempts}`);
+
+    if (!currentUrl.includes('/login') && !currentUrl.includes('/register')) {
+      log('Login', '登录成功，已离开登录页');
+      return;
+    }
+
+    if (currentUrl.includes('/login') || currentUrl.includes('/register')) {
+      log('Login', '仍在登录页，检查是否需要重新登录...');
+
+      const errorMsg = await page.$eval('.ant-form-item-explain-error, .login-error, [class*="error"], .ant-message-error', el => el.textContent).catch(() => null);
+      if (errorMsg) {
+        log('Login', `登录错误提示: ${errorMsg}`);
+      }
+
+      const hasForm = await page.$('input[type="password"]').catch(() => null);
+      if (hasForm) {
+        log('Login', '检测到登录表单，重新填写...');
+        await performLogin(page);
+      } else {
+        log('Login', '未检测到登录表单，等待页面稳定...');
+        await page.waitForTimeout(5000);
+      }
+    }
+  }
+
+  throw new Error('登录失败：多次尝试后仍在登录页，可能账号密码错误或需要验证码');
+}
+
+// ==================== 导航到课程 ====================
 async function navigateToCourse(page) {
   await page.waitForTimeout(2000);
   const currentUrl = page.url();
   log('Navigate', `当前URL: ${currentUrl}`);
-  await saveScreenshot(page, 'step4_current_page');
+  await saveScreenshot(page, 'navigate_start');
 
-  // 如果在作业列表页，点击第一个任务
   if (currentUrl.includes('/student/homework') || currentUrl.includes('/holiday') || currentUrl.includes('/index')) {
     log('Navigate', '在作业/首页，查找任务入口...');
 
-    // 尝试多种选择器
     const selectors = [
       'div.content-Z09Pe:nth-of-type(2) > div.right-DuHqH:nth-of-type(2) > div.list-phpq1 > section > ul > li.taskItem-ZeyMG:nth-of-type(1) > div.row3-Ndo5z:nth-of-type(2) > div.row3_col2-uhJci:nth-of-type(2)',
       'div.btn-AoqsA[data-type="2"]',
@@ -154,12 +223,12 @@ async function navigateToCourse(page) {
     }
 
     if (!clicked) {
-      log('Navigate', '未找到任务入口按钮，尝试直接跳转目标URL');
+      log('Navigate', '未找到任务入口按钮');
     }
   }
 
-  // 确保进入课程页面（直接跳转兜底）
   if (!page.url().includes('student-task-overview')) {
+    log('Navigate', '直接跳转目标课程URL');
     await page.goto('https://teacher.ewt360.com/ewtbend/bend/index/index.html#/holiday/student-task-overview?homeworkId=10508160', {
       waitUntil: 'networkidle',
       timeout: 30000,
@@ -167,9 +236,8 @@ async function navigateToCourse(page) {
     await page.waitForTimeout(3000);
   }
 
-  await saveScreenshot(page, 'step5_course_page');
+  await saveScreenshot(page, 'course_page');
 
-  // 等待视频相关元素
   try {
     await page.waitForSelector('.listCon-zrsBh, video, .item-blpma, .video-js, [class*="video"], [class*="player"]', { timeout: 15000 });
     log('Navigate', '已进入课程播放页面');
@@ -189,7 +257,6 @@ async function mainLoop(page) {
 
   while (errors < CONFIG.maxErrors) {
     try {
-      // 倍速
       await page.evaluate((s) => {
         document.querySelectorAll('.vjs-menu-content .vjs-menu-item').forEach(i => {
           const txt = i.querySelector('.vjs-menu-item-text')?.textContent.trim();
@@ -197,7 +264,6 @@ async function mainLoop(page) {
         });
       }, CONFIG.speed);
 
-      // 跳题
       await page.evaluate(() => {
         const b = Array.from(document.querySelectorAll('button,a,span.btn,div.btn'))
           .find(x => x.textContent.trim() === '跳过');
@@ -208,7 +274,6 @@ async function mainLoop(page) {
         }
       });
 
-      // 过检
       await page.evaluate(() => {
         const b = document.querySelector('span.btn-DOCWn');
         if (b && b.textContent.trim() === '点击通过检查' && !b.dataset.checkClicked) {
@@ -218,7 +283,6 @@ async function mainLoop(page) {
         }
       });
 
-      // 连播
       const r = await page.evaluate((thresh) => {
         const list = document.querySelector('.listCon-zrsBh');
         if (!list) return { action: 'no-list' };
@@ -248,7 +312,6 @@ async function mainLoop(page) {
         lastPct = r.pct;
       }
 
-      // 防挂机
       const stuck = await page.evaluate(() => {
         const v = document.querySelector('video');
         return v && v.paused && v.currentTime > 0 && v.currentTime < v.duration;
