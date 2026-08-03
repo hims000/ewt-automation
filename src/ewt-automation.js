@@ -2,15 +2,13 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-// 确保截图目录存在
 const screenshotDir = path.join(__dirname, '..', 'screenshots');
 if (!fs.existsSync(screenshotDir)) fs.mkdirSync(screenshotDir, { recursive: true });
 
-// ==================== 配置 ====================
 const CONFIG = {
   username: process.env.EWT_USER || '',
   password: process.env.EWT_PASS || '',
-  headless: true,               // GitHub Actions 必须无头
+  headless: true,
   speed: '2X',
   progressThreshold: 0.85,
   checkInterval: 2000,
@@ -32,7 +30,6 @@ const saveScreenshot = async (page, name) => {
   }
 };
 
-// ==================== 注入脚本 ====================
 const BYPASS = `(()=>{
   const oa=EventTarget.prototype.addEventListener,or=EventTarget.prototype.removeEventListener,m=new WeakMap();
   EventTarget.prototype.addEventListener=function(t,l,o){
@@ -47,7 +44,7 @@ const LOCK = `(()=>{if(document.getElementById('ewt-progress-lock-style'))return
 
 const HIDE = `(()=>{Object.defineProperty(navigator,'webdriver',{get:()=>undefined});})();`;
 
-// ==================== 登录 ====================
+// ==================== 登录（修复版） ====================
 async function login(page) {
   log('Login', '打开登录页...');
   await page.goto('https://web.ewt360.com/site-study/#/login', { waitUntil: 'networkidle', timeout: 30000 });
@@ -72,12 +69,13 @@ async function login(page) {
   }
 
   await page.click('button.ant-btn.ant-btn-primary.ant-btn-lg.ant-btn-block');
-  log('Login', '已点击登录');
+  log('Login', '已点击登录，等待页面响应...');
 
-  // 等待响应，检测协议弹窗
-  await page.waitForTimeout(1500);
+  // 等待一段时间让页面处理登录请求
+  await page.waitForTimeout(2000);
   await saveScreenshot(page, 'step2_after_login_click');
 
+  // 检测协议弹窗
   const popupBtn = await page.$('button:has-text("同意"), button:has-text("确认"), .ant-btn:has-text("同意")');
   if (popupBtn && await popupBtn.isVisible().catch(() => false)) {
     const disabled = await popupBtn.evaluate(e => e.disabled).catch(() => false);
@@ -90,63 +88,94 @@ async function login(page) {
     }
     await popupBtn.click();
     log('Login', '已点击弹窗同意按钮');
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(3000); // 给页面跳转更多时间
   }
 
-  // 等待登录成功标志（扩大检测范围）
-  await page.waitForSelector(
-    '.user-avatar, .content-Z09Pe, .taskItem-ZeyMG, .btn-AoqsA, .student-name, .home-container, .listCon-zrsBh, .holiday-task',
-    { timeout: 15000 }
-  );
+  // 等待页面稳定（不强制检测特定元素，而是看URL变化）
+  log('Login', '等待页面加载...');
+  await page.waitForTimeout(5000);
+  await saveScreenshot(page, 'step3_after_agree');
+
+  const currentUrl = page.url();
+  log('Login', `当前页面URL: ${currentUrl}`);
+
+  // 如果还在登录页，说明登录失败
+  if (currentUrl.includes('/login')) {
+    // 检查是否有错误提示
+    const errorMsg = await page.$eval('.ant-form-item-explain-error, .login-error, [class*="error"]', el => el.textContent).catch(() => null);
+    if (errorMsg) {
+      throw new Error(`登录失败: ${errorMsg}`);
+    }
+    // 可能是加载慢，再等等
+    log('Login', '仍在登录页，继续等待...');
+    await page.waitForTimeout(10000);
+    if (page.url().includes('/login')) {
+      throw new Error('登录后页面未跳转，可能账号密码错误或需要验证码');
+    }
+  }
+
   log('Login', '登录成功');
-  await saveScreenshot(page, 'step3_login_success');
 }
 
-// ==================== 导航到课程 ====================
+// ==================== 导航到课程（修复版） ====================
 async function navigateToCourse(page) {
   await page.waitForTimeout(2000);
   const currentUrl = page.url();
   log('Navigate', `当前URL: ${currentUrl}`);
-  await saveScreenshot(page, 'step4_homework_list');
+  await saveScreenshot(page, 'step4_current_page');
 
   // 如果在作业列表页，点击第一个任务
-  if (currentUrl.includes('/student/homework') || currentUrl.includes('/holiday')) {
-    log('Navigate', '在作业列表页，查找任务入口...');
+  if (currentUrl.includes('/student/homework') || currentUrl.includes('/holiday') || currentUrl.includes('/index')) {
+    log('Navigate', '在作业/首页，查找任务入口...');
 
-    // 精确选择器
-    const primary = 'div.content-Z09Pe:nth-of-type(2) > div.right-DuHqH:nth-of-type(2) > div.list-phpq1 > section > ul > li.taskItem-ZeyMG:nth-of-type(1) > div.row3-Ndo5z:nth-of-type(2) > div.row3_col2-uhJci:nth-of-type(2)';
-    const target = await page.$(primary);
+    // 尝试多种选择器
+    const selectors = [
+      'div.content-Z09Pe:nth-of-type(2) > div.right-DuHqH:nth-of-type(2) > div.list-phpq1 > section > ul > li.taskItem-ZeyMG:nth-of-type(1) > div.row3-Ndo5z:nth-of-type(2) > div.row3_col2-uhJci:nth-of-type(2)',
+      'div.btn-AoqsA[data-type="2"]',
+      'div.btn-AoqsA:has(span.text-riKYz:has-text("学"))',
+      'span:has-text("开始学习")',
+      'button:has-text("开始学习")',
+      'a:has-text("开始学习")',
+      '.taskItem-ZeyMG',
+      '[class*="task"]',
+      '[class*="homework"]',
+    ];
 
-    if (target && await target.isVisible().catch(() => false)) {
-      log('Navigate', '找到主目标，点击...');
-      await target.click();
-    } else {
-      // 备选：data-type="2" 的"学"按钮
-      const btn = await page.$('div.btn-AoqsA[data-type="2"]');
-      if (btn && await btn.isVisible().catch(() => false)) {
-        log('Navigate', '找到"学"按钮，点击...');
-        await btn.click();
-      } else {
-        // 兜底：直接跳转目标URL
-        log('Navigate', '未找到按钮，直接跳转目标URL');
-        await page.goto('https://teacher.ewt360.com/ewtbend/bend/index/index.html#/holiday/student-task-overview?homeworkId=10508160', {
-          waitUntil: 'networkidle',
-          timeout: 30000,
-        });
+    let clicked = false;
+    for (const sel of selectors) {
+      const el = await page.$(sel);
+      if (el && await el.isVisible().catch(() => false)) {
+        log('Navigate', `找到元素，点击: ${sel}`);
+        await el.click();
+        clicked = true;
+        await page.waitForTimeout(3000);
+        break;
       }
+    }
+
+    if (!clicked) {
+      log('Navigate', '未找到任务入口按钮，尝试直接跳转目标URL');
     }
   }
 
-  // 等待课程页面加载
-  await page.waitForTimeout(2000);
+  // 确保进入课程页面（直接跳转兜底）
+  if (!page.url().includes('student-task-overview')) {
+    await page.goto('https://teacher.ewt360.com/ewtbend/bend/index/index.html#/holiday/student-task-overview?homeworkId=10508160', {
+      waitUntil: 'networkidle',
+      timeout: 30000,
+    });
+    await page.waitForTimeout(3000);
+  }
+
   await saveScreenshot(page, 'step5_course_page');
 
+  // 等待视频相关元素
   try {
-    await page.waitForSelector('.listCon-zrsBh, video, .item-blpma, .video-js, [class*="video"]', { timeout: 15000 });
+    await page.waitForSelector('.listCon-zrsBh, video, .item-blpma, .video-js, [class*="video"], [class*="player"]', { timeout: 15000 });
     log('Navigate', '已进入课程播放页面');
   } catch (e) {
     log('Navigate', '未检测到标准视频列表，尝试备用检测...');
-    await page.waitForSelector('video, iframe', { timeout: 10000 });
+    await page.waitForSelector('video, iframe, [class*="play"]', { timeout: 10000 });
     log('Navigate', '检测到视频播放器');
   }
 }
@@ -160,7 +189,7 @@ async function mainLoop(page) {
 
   while (errors < CONFIG.maxErrors) {
     try {
-      // 1. 维持倍速
+      // 倍速
       await page.evaluate((s) => {
         document.querySelectorAll('.vjs-menu-content .vjs-menu-item').forEach(i => {
           const txt = i.querySelector('.vjs-menu-item-text')?.textContent.trim();
@@ -168,7 +197,7 @@ async function mainLoop(page) {
         });
       }, CONFIG.speed);
 
-      // 2. 自动跳题
+      // 跳题
       await page.evaluate(() => {
         const b = Array.from(document.querySelectorAll('button,a,span.btn,div.btn'))
           .find(x => x.textContent.trim() === '跳过');
@@ -179,7 +208,7 @@ async function mainLoop(page) {
         }
       });
 
-      // 3. 自动过检
+      // 过检
       await page.evaluate(() => {
         const b = document.querySelector('span.btn-DOCWn');
         if (b && b.textContent.trim() === '点击通过检查' && !b.dataset.checkClicked) {
@@ -189,8 +218,8 @@ async function mainLoop(page) {
         }
       });
 
-      // 4. 自动连播
-      const result = await page.evaluate((thresh) => {
+      // 连播
+      const r = await page.evaluate((thresh) => {
         const list = document.querySelector('.listCon-zrsBh');
         if (!list) return { action: 'no-list' };
         const all = Array.from(list.querySelectorAll('.item-blpma'));
@@ -206,20 +235,20 @@ async function mainLoop(page) {
         return { action: 'switched', to: idx + 2, total: all.length };
       }, CONFIG.progressThreshold);
 
-      if (result.action === 'switched') {
-        log('AutoPlay', `✅ 已切换到第 ${result.to}/${result.total} 个视频`);
+      if (r.action === 'switched') {
+        log('AutoPlay', `✅ 已切换到第 ${r.to}/${r.total} 个视频`);
         lastSwitch = Date.now();
         await page.evaluate(LOCK);
-      } else if (result.action === 'finished') {
+      } else if (r.action === 'finished') {
         log('AutoPlay', '🎉 所有视频已播放完毕！');
-        await saveScreenshot(page, 'step6_finished');
+        await saveScreenshot(page, 'finished');
         break;
-      } else if (result.action === 'waiting' && result.pct !== lastPct) {
-        log('AutoPlay', `⏳ 当前进度: ${result.pct}`);
-        lastPct = result.pct;
+      } else if (r.action === 'waiting' && r.pct !== lastPct) {
+        log('AutoPlay', `⏳ 当前进度: ${r.pct}`);
+        lastPct = r.pct;
       }
 
-      // 5. 防挂机：视频暂停自动恢复
+      // 防挂机
       const stuck = await page.evaluate(() => {
         const v = document.querySelector('video');
         return v && v.paused && v.currentTime > 0 && v.currentTime < v.duration;
@@ -231,7 +260,6 @@ async function mainLoop(page) {
 
       errors = 0;
       await page.waitForTimeout(CONFIG.checkInterval);
-
     } catch (err) {
       errors++;
       log('Main', `❌ 循环出错 (${errors}/${CONFIG.maxErrors}): ${err.message}`);
