@@ -29,9 +29,10 @@ jobs:
           EWT_PASS: ${{ secrets.EWT_PASS }}
           CI: true
 
-      - name: Upload screenshots on failure
-        if: failure()
+      - name: Upload screenshots (always)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshots
+          name: screenshots-all
           path: screenshots/
+          if-no-files-found: ignore
