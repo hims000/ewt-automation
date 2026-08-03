@@ -45,21 +45,18 @@ const saveScreenshot = async (page, name) => {
   }
 };
 
-// ==================== 网络诊断 ====================
-function pingHost(host, count = 3) {
+// 打印页面HTML片段用于调试
+const dumpPageHtml = async (page, maxLen = 2000) => {
   try {
-    const cmd = process.platform === 'win32'
-      ? `ping -n ${count} ${host}`
-      : `ping -c ${count} -W 5 ${host}`;
-    const output = execSync(cmd, { encoding: 'utf8', timeout: 20000 });
-    const lines = output.trim().split('\n');
-    const summary = lines[lines.length - 2] || lines[lines.length - 1];
-    return { success: true, summary: summary.trim() };
+    const html = await page.content();
+    const snippet = html.replace(/\s+/g, ' ').slice(0, maxLen);
+    log('Debug', `页面HTML前${maxLen}字符: ${snippet}`);
   } catch (e) {
-    return { success: false, error: e.message, stdout: e.stdout?.toString() };
+    log('Debug', `获取HTML失败: ${e.message}`);
   }
-}
+};
 
+// ==================== 网络诊断 ====================
 function dnsLookup(hostname) {
   return new Promise((resolve) => {
     dns.lookup(hostname, { all: true }, (err, addresses) => {
@@ -77,8 +74,7 @@ function httpCheck(url, timeout = 10000) {
       res.on('end', () => resolve({
         success: true,
         status: res.statusCode,
-        headers: res.headers,
-        bodyPreview: data.slice(0, 200).replace(/\s+/g, ' ')
+        bodyPreview: data.slice(0, 500).replace(/\s+/g, ' ')
       }));
     });
     req.on('error', (e) => resolve({ success: false, error: e.message }));
@@ -89,55 +85,38 @@ function httpCheck(url, timeout = 10000) {
 
 async function networkDiagnostics() {
   log('NetDiag', '========== 网络诊断开始 ==========');
-
-  // 1. 检查本机IP
   try {
-    const ip = execSync('curl -s https://api.ipify.org || curl -s https://httpbin.org/ip', { encoding: 'utf8', timeout: 10000 });
+    const ip = execSync('curl -s https://api.ipify.org', { encoding: 'utf8', timeout: 10000 });
     log('NetDiag', `本机出口IP: ${ip.trim()}`);
   } catch (e) {
     log('NetDiag', `获取本机IP失败: ${e.message}`);
   }
 
-  // 2. DNS 解析
   for (const host of ['web.ewt360.com', 'teacher.ewt360.com']) {
     const dnsResult = await dnsLookup(host);
     log('NetDiag', `DNS ${host}:`, dnsResult);
   }
 
-  // 3. Ping
-  for (const host of ['web.ewt360.com', 'teacher.ewt360.com']) {
-    const pingResult = pingHost(host);
-    log('NetDiag', `Ping ${host}:`, pingResult);
-  }
-
-  // 4. HTTPS 连通性
   for (const url of ['https://web.ewt360.com', 'https://teacher.ewt360.com']) {
     const httpResult = await httpCheck(url);
     log('NetDiag', `HTTP ${url}:`, httpResult);
   }
 
-  // 5. 检查到目标URL的连通性
-  const targetResult = await httpCheck('https://teacher.ewt360.com/ewtbend/bend/index/index.html');
-  log('NetDiag', `HTTP 目标页面:`, targetResult);
-
   log('NetDiag', '========== 网络诊断结束 ==========');
 }
 
-// ==================== 页面加载诊断版 ====================
-async function gotoWithDiagnostics(page, url, options = {}) {
+// ==================== 页面加载 ====================
+async function gotoWithRetry(page, url, options = {}) {
   const opts = { timeout: 60000, waitUntil: 'load', ...options };
   for (let i = 0; i < 3; i++) {
     try {
       log('Navigate', `尝试访问 ${url} (第${i + 1}次)...`);
       const start = Date.now();
       await page.goto(url, opts);
-      const elapsed = Date.now() - start;
-      log('Navigate', `页面加载成功，耗时 ${elapsed}ms`);
+      log('Navigate', `页面加载成功，耗时 ${Date.now() - start}ms，当前URL: ${page.url()}`);
       return;
     } catch (e) {
       log('Navigate', `第${i + 1}次加载失败: ${e.message}`);
-      log('Navigate', '加载失败，执行网络诊断...');
-      await networkDiagnostics();
       if (i === 2) throw e;
       await page.waitForTimeout(5000);
     }
@@ -203,21 +182,43 @@ async function handleAgreementModal(page) {
   return false;
 }
 
+// ==================== 检测页面是否有登录表单 ====================
+async function hasLoginForm(page) {
+  const userInput = await page.$('input#login__password_userName').catch(() => null);
+  const passInput = await page.$('input#login__password_password').catch(() => null);
+  const anyUser = await page.$('input[placeholder*="账号"], input[name="username"]').catch(() => null);
+  const anyPass = await page.$('input[placeholder*="密码"], input[name="password"], input[type="password"]').catch(() => null);
+
+  log('Login', `登录表单检测: userInput=${!!userInput} passInput=${!!passInput} anyUser=${!!anyUser} anyPass=${!!anyPass}`);
+
+  return !!(userInput || anyUser) && !!(passInput || anyPass);
+}
+
 // ==================== 通用登录函数 ====================
 async function performLogin(page) {
   log('Login', '尝试在当前页面登录...');
   await saveScreenshot(page, 'login_attempt');
+  await dumpPageHtml(page, 1500);
 
-  const hasUserInput = await page.$('input#login__password_userName, input[placeholder*="账号"], input[name="username"], input[type="text"]').catch(() => null);
-  const hasPassInput = await page.$('input#login__password_password, input[placeholder*="密码"], input[name="password"], input[type="password"]').catch(() => null);
-
-  if (!hasUserInput || !hasPassInput) {
-    log('Login', '当前页面没有登录表单');
+  const hasForm = await hasLoginForm(page);
+  if (!hasForm) {
+    log('Login', '当前页面没有登录表单，打印页面标题...');
+    const title = await page.title().catch(() => 'unknown');
+    log('Login', `页面标题: "${title}"`);
     return false;
   }
 
-  await page.fill('input#login__password_userName, input[placeholder*="账号"], input[name="username"], input[type="text"]', CONFIG.username);
-  await page.fill('input#login__password_password, input[placeholder*="密码"], input[name="password"], input[type="password"]', CONFIG.password);
+  // 优先使用精确ID
+  const userInput = await page.$('input#login__password_userName');
+  const passInput = await page.$('input#login__password_password');
+
+  if (userInput && passInput) {
+    await userInput.fill(CONFIG.username);
+    await passInput.fill(CONFIG.password);
+  } else {
+    await page.fill('input[placeholder*="账号"], input[name="username"]', CONFIG.username);
+    await page.fill('input[placeholder*="密码"], input[name="password"], input[type="password"]', CONFIG.password);
+  }
   log('Login', '已填写账号密码');
 
   const cb = await page.$('label.ant-checkbox-wrapper input[type="checkbox"], input[type="checkbox"]').catch(() => null);
@@ -252,8 +253,9 @@ async function performLogin(page) {
 // ==================== 主登录流程 ====================
 async function login(page) {
   log('Login', '打开登录页...');
-  await gotoWithDiagnostics(page, 'https://web.ewt360.com/site-study/#/login');
+  await gotoWithRetry(page, 'https://web.ewt360.com/site-study/#/login');
   await saveScreenshot(page, 'login_page_loaded');
+  await dumpPageHtml(page, 1500);
 
   if (!CONFIG.username || !CONFIG.password) {
     throw new Error('缺少账号或密码，请设置 EWT_USER 和 EWT_PASS 环境变量');
@@ -267,30 +269,28 @@ async function login(page) {
   while (attempts < maxAttempts) {
     attempts++;
     const currentUrl = page.url();
-    log('Login', `第${attempts}次尝试后URL: ${currentUrl}`);
+    const hasForm = await hasLoginForm(page);
+    log('Login', `第${attempts}次检查: URL=${currentUrl} hasForm=${hasForm}`);
     await saveScreenshot(page, `login_check_${attempts}`);
+    await dumpPageHtml(page, 1000);
 
-    if (!currentUrl.includes('/login') && !currentUrl.includes('/register')) {
-      log('Login', '登录成功，已离开登录页');
+    // 如果页面没有登录表单且不在登录页，认为登录成功
+    if (!hasForm && !currentUrl.includes('/login') && !currentUrl.includes('/register')) {
+      log('Login', '登录成功，已离开登录页且无登录表单');
       return;
     }
 
-    if (currentUrl.includes('/login') || currentUrl.includes('/register')) {
-      log('Login', '仍在登录页，检查是否需要重新登录...');
+    // 如果页面没有登录表单但在登录页，可能是被重定向了，等一等
+    if (!hasForm && (currentUrl.includes('/login') || currentUrl.includes('/register'))) {
+      log('Login', '在登录页但没有表单，等待页面加载...');
+      await page.waitForTimeout(5000);
+      continue;
+    }
 
-      const errorMsg = await page.$eval('.ant-form-item-explain-error, .login-error, [class*="error"], .ant-message-error', el => el.textContent).catch(() => null);
-      if (errorMsg) {
-        log('Login', `登录错误提示: ${errorMsg}`);
-      }
-
-      const hasForm = await page.$('input[type="password"]').catch(() => null);
-      if (hasForm) {
-        log('Login', '检测到登录表单，重新填写...');
-        await performLogin(page);
-      } else {
-        log('Login', '未检测到登录表单，等待页面稳定...');
-        await page.waitForTimeout(5000);
-      }
+    // 如果还有表单，重新尝试登录
+    if (hasForm) {
+      log('Login', '检测到登录表单仍在，重新填写...');
+      await performLogin(page);
     }
   }
 
@@ -303,7 +303,9 @@ async function navigateToCourse(page) {
   const currentUrl = page.url();
   log('Navigate', `当前URL: ${currentUrl}`);
   await saveScreenshot(page, 'navigate_start');
+  await dumpPageHtml(page, 1000);
 
+  // 如果在作业列表页，点击第一个任务
   if (currentUrl.includes('/student/homework') || currentUrl.includes('/holiday') || currentUrl.includes('/index')) {
     log('Navigate', '在作业/首页，查找任务入口...');
 
@@ -336,22 +338,44 @@ async function navigateToCourse(page) {
     }
   }
 
+  // 确保进入课程页面
   if (!page.url().includes('student-task-overview')) {
     log('Navigate', '直接跳转目标课程URL');
-    await gotoWithDiagnostics(page, 'https://teacher.ewt360.com/ewtbend/bend/index/index.html#/holiday/student-task-overview?homeworkId=10508160');
+    await gotoWithRetry(page, 'https://teacher.ewt360.com/ewtbend/bend/index/index.html#/holiday/student-task-overview?homeworkId=10508160');
     await page.waitForTimeout(3000);
   }
 
   await saveScreenshot(page, 'course_page');
+  await dumpPageHtml(page, 2000);
 
-  try {
-    await page.waitForSelector('.listCon-zrsBh, video, .item-blpma, .video-js, [class*="video"], [class*="player"]', { timeout: 15000 });
-    log('Navigate', '已进入课程播放页面');
-  } catch (e) {
-    log('Navigate', '未检测到标准视频列表，尝试备用检测...');
-    await page.waitForSelector('video, iframe, [class*="play"]', { timeout: 10000 });
-    log('Navigate', '检测到视频播放器');
+  // 更宽松的检测：先等页面稳定
+  log('Navigate', '等待页面元素稳定...');
+  await page.waitForTimeout(5000);
+
+  // 检测视频相关元素（扩大范围）
+  const videoSelectors = [
+    'video',
+    'iframe',
+    '.listCon-zrsBh',
+    '.item-blpma',
+    '.video-js',
+    '[class*="video"]',
+    '[class*="player"]',
+    '[class*="play"]',
+    '.vjs-tech',
+    '#vjs_video_3',
+    '[id*="video"]',
+  ];
+
+  for (const sel of videoSelectors) {
+    const el = await page.$(sel);
+    if (el) {
+      log('Navigate', `找到视频相关元素: ${sel}`);
+      return;
+    }
   }
+
+  log('Navigate', '未找到任何视频相关元素，但继续执行...');
 }
 
 // ==================== 主循环 ====================
@@ -386,7 +410,7 @@ async function mainLoop(page) {
         return changed;
       }, CONFIG.speed);
       if (speedChanged) log('Loop', `已切换倍速到 ${CONFIG.speed}`);
-      else log('Loop', '倍速正常，无需调整');
+      else log('Loop', '倍速正常或不存在倍速菜单');
 
       // 2. 自动跳题
       log('Loop', '检查是否有"跳过"按钮...');
@@ -460,11 +484,9 @@ async function mainLoop(page) {
         log('AutoPlay', '🎉 所有视频已播放完毕！');
         await saveScreenshot(page, 'finished');
         break;
-      } else if (result.action === 'waiting') {
-        if (result.pct !== lastPct) {
-          log('AutoPlay', `⏳ 当前进度: ${result.pct} (${result.current}s / ${result.total}s) [暂停:${result.paused} 结束:${result.ended}]`);
-          lastPct = result.pct;
-        }
+      } else if (result.action === 'waiting' && result.pct !== lastPct) {
+        log('AutoPlay', `⏳ 当前进度: ${result.pct} (${result.current}s / ${result.total}s) [暂停:${result.paused} 结束:${result.ended}]`);
+        lastPct = result.pct;
       } else if (result.action === 'no-list') {
         log('AutoPlay', '⚠️ 未找到视频列表 (.listCon-zrsBh)，可能页面结构不同');
       } else if (result.action === 'no-active') {
@@ -487,7 +509,7 @@ async function mainLoop(page) {
           log('Main', '已调用 video.play()');
         }
       } else {
-        log('Loop', '视频播放正常');
+        log('Loop', '视频播放正常或不存在视频');
       }
 
       errors = 0;
@@ -511,7 +533,6 @@ async function mainLoop(page) {
 (async () => {
   log('Main', '启动浏览器 (GitHub Actions 模式)...');
 
-  // 启动前先做网络诊断
   await networkDiagnostics();
 
   const browser = await chromium.launch({
